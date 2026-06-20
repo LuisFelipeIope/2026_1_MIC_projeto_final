@@ -16,6 +16,7 @@ Desafios extra:
 -Setpoint via bot�es f�sicos (feito)
 @Luis adicionar aqui os desafios que conseguirmos implementar
 -Display local (LCD ou 7 segmentos)
+-Amostragem por timer/interrupção
 */
 
 #define F_CPU 16000000
@@ -45,6 +46,10 @@ uint16_t gUltimaTempGravada = 0xFFFF; //Guarda a última temperatura gravada, pr
 volatile char gUartBuffer[UART_BUFFER_SIZE]; //string que guarda os caracteres que chegam
 volatile uint8_t gUartIndex = 0; //guarda posi��o atual onde o pr�ximo caractere ser� salvo no vetor
 volatile uint8_t gComandoPronto = 0; //flag que vira 1 quando o usu�rio aperta enter no terminal
+
+//Variável pra base de tempo do controle:
+volatile uint8_t gTick = 0; /*flag que o Timer1 seta a cada 250ms, avisa o loop principal que chegou 
+                            a hora de ler o sensor e atualizar o controle*/
 
 /*
 Pinos do display LCD 16x2. Todos os 6 sinais que
@@ -250,6 +255,40 @@ uint16_t filtro_adc(uint16_t tNovaLeitura)
 	gAcumuladorFiltro = gAcumuladorFiltro - (gAcumuladorFiltro >> FILTRO_SHIFT) + tNovaLeitura;
 
 	return (gAcumuladorFiltro >> FILTRO_SHIFT);
+}
+
+/*
+Função que configura o Timer1 (o único timer de 16 bits do ATmega328P) em
+modo CTC (Clear Timer on Compare Match), fazendo ele gerar uma interrupção
+a cada 250 milissegundos. O bit WGM12 liga o modo CTC, o bit CS12 sozinho
+seleciona o prescaler 256 (tabela de seleção de clock do datasheet), e o
+valor de OCR1A é calculado assim: o timer conta a 16MHz/256 = 62500
+contagens por segundo, então pra fechar 250ms (0,25s) precisamos de
+62500 × 0,25 = 15625 contagens. Como o timer reseta depois de atingir
+OCR1A, usamos OCR1A = 15624 (15625 - 1) pra ter exatamente 250ms, sem
+erro de arredondamento. O OCIE1A habilita a interrupção de "compare
+match A", que é disparada toda vez que o contador bate nesse valor.
+*/
+void timer1_init(void)
+{
+	TCCR1A = 0;
+	TCCR1B = (1<<WGM12) | (1<<CS12); //modo CTC, prescaler = 256
+	OCR1A = 15624; //(15624+1)*256/16MHz = 0.25s exatos
+	TIMSK1 |= (1<<OCIE1A);
+}
+
+/*
+Interrupção disparada pelo Timer1 toda vez que o contador bate em OCR1A,
+ou seja, a cada 250ms certinhos, garantidos pelo hardware. Repare que
+essa interrupção não faz leitura de ADC nem cálculo de controle nem nada
+pesado - ela só levanta a flag gTick, que o loop principal fica observando.
+Isso é proposital: interrupções devem ser curtas, senão elas atrasam ou
+até bloqueiam outras interrupções importantes (como a do RX da serial)
+enquanto estão rodando.
+*/
+ISR(TIMER1_COMPA_vect)
+{
+	gTick = 1;
 }
 
 //Protótipos das funções (declaradas aqui em cima pra poderem ser chamadas em qualquer ordem no arquivo)
