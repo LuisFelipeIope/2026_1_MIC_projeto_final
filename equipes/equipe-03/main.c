@@ -13,10 +13,12 @@ UART RX (recebimento de comandos)
 Controle ON-OFF
 
 Desafios extra:
--Setpoint via bot�es f�sicos (feito)
-@Luis adicionar aqui os desafios que conseguirmos implementar
+-Setpoint via bot�es f�sicos
+-Sistema de alarme configurável
+-Log de dados em EEPROM
 -Display local (LCD ou 7 segmentos)
 -Amostragem por timer/interrupção
+-Filtro digital no sinal do LM35
 */
 
 #define F_CPU 16000000
@@ -27,10 +29,10 @@ Desafios extra:
 #include <stdlib.h>
 #include <avr/eeprom.h> //Biblioteca pra leitura e escrita na EEPROM interna
 
-//Vari�veis globais:
-uint16_t gTemperatura = 0; //Temperatura atual em �C
-uint16_t gSetpoint = 25; //Temperatura desejada em �C
-uint8_t gLampadaLigada = 0; //Flag para l�mpada (0 para desligada, 1 para ligada)
+//Variáveis globais:
+uint16_t gTemperatura = 0; //Temperatura atual em °C (já filtrada)
+uint16_t gSetpoint = 25; //Temperatura desejada em °C
+uint8_t gLampadaLigada = 0; //Flag para lâmpada (0 para desligada, 1 para ligada)
 uint16_t gLimiarAlarme = 25; //Temperatura que dispara o alarme em °C (editável via serial: AL=)
 uint8_t gAlarmeAtivo = 0; //Flag que indica se o alarme já foi enviado (evita ficar mandando toda hora)
 
@@ -39,17 +41,16 @@ uint8_t *gEepromHistorico = (uint8_t*)1; //Endereço inicial do vetor de histór
 uint8_t gHistIndice = 0; //Índice atual do buffer circular (cópia em RAM do que está na EEPROM)
 uint16_t gUltimaTempGravada = 0xFFFF; //Guarda a última temperatura gravada, pra só escrever na EEPROM quando o valor mudar
 
-#define UART_BUFFER_SIZE 16 //Texto recebido pela uart de no m�x 16 caracteres
+#define UART_BUFFER_SIZE 16 //Texto recebido pela uart de no máx 16 caracteres
 #define HISTORICO_TAMANHO 10 //Quantidade de amostras guardadas no histórico circular da EEPROM
 
-//Vari�veis pra comunica��o serial:
+//Variáveis pra comunicação serial:
 volatile char gUartBuffer[UART_BUFFER_SIZE]; //string que guarda os caracteres que chegam
-volatile uint8_t gUartIndex = 0; //guarda posi��o atual onde o pr�ximo caractere ser� salvo no vetor
-volatile uint8_t gComandoPronto = 0; //flag que vira 1 quando o usu�rio aperta enter no terminal
+volatile uint8_t gUartIndex = 0; //guarda posição atual onde o próximo caractere será salvo no vetor
+volatile uint8_t gComandoPronto = 0; //flag que vira 1 quando o usuário aperta enter no terminal
 
 //Variável pra base de tempo do controle:
-volatile uint8_t gTick = 0; /*flag que o Timer1 seta a cada 250ms, avisa o loop principal que chegou 
-                            a hora de ler o sensor e atualizar o controle*/
+volatile uint8_t gTick = 0; //flag que o Timer1 seta a cada 250ms, avisa o loop principal que chegou a hora de ler o sensor e atualizar o controle
 
 /*
 Pinos do display LCD 16x2. Todos os 6 sinais que
@@ -66,6 +67,14 @@ ele não aparece aqui como pino controlado pelo micro.
 #define LCD_D5 PB3
 #define LCD_D6 PB4
 #define LCD_D7 PB5
+
+//Protótipos das funções (declaradas aqui em cima pra poderem ser chamadas em qualquer ordem no arquivo)
+void uart_init(uint32_t tBaud);
+void uart_putchar(char tDado);
+void uart_print(const char *tStr);
+void processar_comando(void);
+void salvar_historico_eeprom(void);
+void enviar_historico_eeprom(void);
 
 /*
 Função que gera o pulso no pino EN (Enable) do LCD. É esse pulso que avisa
@@ -137,7 +146,7 @@ no display em vez de mandar pela serial.
 void lcd_string(const char *tStr)
 {
 	while (*tStr)
-	lcd_data(*tStr++);
+		lcd_data(*tStr++);
 }
 
 /*
@@ -291,54 +300,46 @@ ISR(TIMER1_COMPA_vect)
 	gTick = 1;
 }
 
-//Protótipos das funções (declaradas aqui em cima pra poderem ser chamadas em qualquer ordem no arquivo)
-void uart_init(uint32_t tBaud);
-void uart_putchar(char tDado);
-void uart_print(const char *tStr);
-void processar_comando(void);
-void salvar_historico_eeprom(void);
-void enviar_historico_eeprom(void);
-
-ISR(USART_RX_vect) //Interrup��o solicitada toda vez que um caractere chega no pino RX
+ISR(USART_RX_vect) //Interrupção solicitada toda vez que um caractere chega no pino RX
 {
-	char tByte = UDR0; //L� o registrador onde o caractere recebido fica guardado e salva na vari�vel tempor�ria tByte
+	char tByte = UDR0; //Lê o registrador onde o caractere recebido fica guardado e salva na variável temporária tByte
 
 	if (tByte == '\n' || tByte == '\r') //Verifica se o caractere recebido foi uma quebra de linha (\n) ou um Enter (\r)
 	{
-		if (gUartIndex > 0) //Garante que o usu�rio digitou alguma coisa antes de apertar Enter (�ndice tem que ser maior que zero)
+		if (gUartIndex > 0) //Garante que o usuário digitou alguma coisa antes de apertar Enter (índice tem que ser maior que zero)
 		{
-			gUartBuffer[gUartIndex] = '\0'; //Adiciona o caractere nulo no final do buffer transformando o vetor em uma string v�lida no C
-			gComandoPronto = 1; //Sinaliza para o programa principal que h� um comando completo esperando para ser processado
-			gUartIndex = 0; //Reseta o �ndice para que o pr�ximo comando comece a ser gravado do in�cio do vetor
+			gUartBuffer[gUartIndex] = '\0'; //Adiciona o caractere nulo no final do buffer transformando o vetor em uma string válida no C
+			gComandoPronto = 1; //Sinaliza para o programa principal que há um comando completo esperando para ser processado
+			gUartIndex = 0; //Reseta o índice para que o próximo comando comece a ser gravado do início do vetor
 		}
 	}
-	/*Se o caractere n�o for um enter ele entra aqui, verifica se ainda h� espa�o no 
-	buffer para evitar estouro de mem�ria (UART_BUFFER_SIZE - 1),se houver espa�o, 
-	o caractere � salvo no buffer e o �ndice � incrementado (gUartIndex++)*/
+	/*Se o caractere não for um enter ele entra aqui, verifica se ainda há espaço no 
+	buffer para evitar estouro de memória (UART_BUFFER_SIZE - 1),se houver espaço, 
+	o caractere é salvo no buffer e o índice é incrementado (gUartIndex++)*/
 	else if (gUartIndex < (UART_BUFFER_SIZE - 1))
 	{
 		gUartBuffer[gUartIndex++] = tByte;
 	}
 }
 
-void uart_init(uint32_t tBaud)//Fun��o que configura a velocidade e os pinos da comunica��o serial
+void uart_init(uint32_t tBaud)//Função que configura a velocidade e os pinos da comunicação serial
 {
-	uint16_t tUbrr = (F_CPU / (16UL * tBaud)) - 1; //Equa��o da tabela 19-1 do datasheet pro c�lculo da taxa de transmiss�o (UBRR)
+	uint16_t tUbrr = (F_CPU / (16UL * tBaud)) - 1; //Equação da tabela 19-1 do datasheet pro cálculo da taxa de transmissão (UBRR)
 
 	UBRR0H = (uint8_t)(tUbrr >> 8);
 	UBRR0L = (uint8_t)tUbrr;
 
-	UCSR0B = (1<<TXEN0) //Habilita transmiss�o
-		   | (1<<RXEN0) //Habilita recep��o
-		   | (1<<RXCIE0); //Habilita interrup��o de recep��o
+	UCSR0B = (1<<TXEN0) //Habilita transmissão
+		   | (1<<RXEN0) //Habilita recepção
+		   | (1<<RXCIE0); //Habilita interrupção de recepção
 		   
 	UCSR0C = (1<<UCSZ01) | (1<<UCSZ00); //frame de 8 bits, sem paridade e 1 bit de parada
 }
 
 /*
-Fun��o que envia um �nico caractere, o while fica travado esperando o bit UDRE0 
+Função que envia um único caractere, o while fica travado esperando o bit UDRE0 
 (do registrador UCSR0A) ficar em 1, o que significa que o hardware terminou de 
-enviar o caractere anterior e o buffer de transmiss�o est� vazio, quando libera, 
+enviar o caractere anterior e o buffer de transmissão está vazio, quando libera, 
 ele joga o caractere em UDR0 para ser transmitido fisicamente
 */
 void uart_putchar(char tDado)
@@ -348,8 +349,8 @@ void uart_putchar(char tDado)
 }
 
 /*
-Fun��o que recebe um ponteiro para um texto (string) e vai enviando caractere 
-por caractere usando a fun��o uart_putchar at� encontrar o fim do texto (\0).
+Função que recebe um ponteiro para um texto (string) e vai enviando caractere 
+por caractere usando a função uart_putchar até encontrar o fim do texto (\0).
 */
 void uart_print(const char *tStr)
 {
@@ -358,18 +359,18 @@ void uart_print(const char *tStr)
 }
 
 /*
-Cria uma c�pia local (tComando) do buffer global da UART. Isso serve para liberar o 
-buffer original de forma segura ou manipul�-lo sem interfer�ncias.
+Cria uma cópia local (tComando) do buffer global da UART. Isso serve para liberar o 
+buffer original de forma segura ou manipulá-lo sem interferências.
 */
 void processar_comando(void)
 {
 	char tComando[UART_BUFFER_SIZE];
 	
-	//Copia o conte�do do buffer global para uma vari�vel local, evita que um novo dado chegue pela UART enquanto outro dado esteja sendo processado
+	//Copia o conteúdo do buffer global para uma variável local, evita que um novo dado chegue pela UART enquanto outro dado esteja sendo processado
 	for (uint8_t i = 0; i < UART_BUFFER_SIZE; i++)
 	tComando[i] = gUartBuffer[i];
 	
-	//Verifica se o texto enviado come�a exatamente com as letras "SP=" (Set Point).
+	//Verifica se o texto enviado começa exatamente com as letras "SP=" (Set Point).
 	if (tComando[0]=='S' && tComando[1]=='P' && tComando[2]=='=')
 	{
 		uint16_t tNovoSetpoint = (uint16_t)atoi(&tComando[3]);
@@ -459,7 +460,7 @@ int main(void)
 	DDRC &= ~((1<<DDC0) | (1<<DDC1)); //PC0 e PC1 como entrada
 	PORTC |= (1<<PORTC0) | (1<<PORTC1); //Ativa pull-up do PC0 e PC1
 
-	DDRD |= (1<<DDD5); //PD5 como sa�da (PWM que controla a potencia da lampada)
+	DDRD |= (1<<DDD5); //PD5 como saída (PWM que controla a potencia da lampada)
 	DDRD |= (1<<DDD7); //PD7 como saída (aciona o buzzer do alarme sonoro)
 
 	//Modo fast PWM
@@ -469,17 +470,19 @@ int main(void)
 	OCR0A = 99;
 	OCR0B = 0;
 
-	ADMUX = (1<<REFS1)|(1<<REFS0) //Referencia de tens�o interna de 1,1V
+	ADMUX = (1<<REFS1)|(1<<REFS0) //Referencia de tensão interna de 1,1V
 	| (0<<MUX3)|(1<<MUX2)|(0<<MUX1)|(1<<MUX0); //ADC5
 
 	ADCSRA = (1<<ADEN) //Habilita ADC
 	| (1<<ADPS2)|(1<<ADPS1)|(1<<ADPS0); //Prescaler do ADC em 128
 
-	DIDR0 = (1<<ADC5D); //Desabilita buffer do ADC5 que j� est� sendo usado como entrada anal�gica
+	DIDR0 = (1<<ADC5D); //Desabilita buffer do ADC5 que já está sendo usado como entrada analógica
 
 	uart_init(9600); //inicializa uart com 9600 de baud
+	timer1_init(); //liga a base de tempo de 250ms que substitui o _delay_ms(250) bloqueante
+	lcd_init(); //configura o display antes de começar a usar ele no loop
 
-	sei(); //habilita interrup��es globais
+	sei(); //habilita interrupções globais
 	
 	gHistIndice = eeprom_read_byte(gEepromIndice); //Recupera o índice do histórico salvo na EEPROM (sobrevive a reset/desligamento)
 	if (gHistIndice >= HISTORICO_TAMANHO) //Proteção: se a EEPROM nunca foi gravada (vem com 0xFF de fábrica), zera o índice
@@ -487,29 +490,16 @@ int main(void)
 
 	while (1)
 	{
-		ADCSRA |= (1<<ADSC);
-		while (ADCSRA & (1<<ADSC));
-		
-		//Converte valor bruto do ADC (0-1023) em �C
-		gTemperatura = ((uint32_t)ADC * 1100) / 1024 / 10;
-		
-		//Salva a leitura atual no histórico da EEPROM (buffer circular de 10 posições)
-		salvar_historico_eeprom();
-
-		//Controle ON-OFF com histerese de +- 1�C
-		if (!gLampadaLigada && gTemperatura <= (gSetpoint - 1))
+		//Comandos da UART são processados assim que chegam, sem esperar
+		//o tick do timer, pra manter a serial respondendo rápido
+		if (gComandoPronto)
 		{
-			gLampadaLigada = 1;
-			OCR0B = 99;
+			gComandoPronto = 0;
+			processar_comando();
 		}
 
-		if (gLampadaLigada && gTemperatura >= (gSetpoint + 1))
-		{
-			gLampadaLigada = 0;
-			OCR0B = 0;
-		}
-		
-		//Se o bot�o for pressionado decrementa SP
+		//Botões também ficam fora do tick, continuam respondendo a cada volta do loop
+		//Se o botão for pressionado decrementa SP
 		if (!(PINC & (1<<PINC0)))
 		{
 			if (gSetpoint > 0)
@@ -518,8 +508,8 @@ int main(void)
 			while (!(PINC & (1<<PINC0)));
 			_delay_ms(100);
 		}
-		
-		//Se o bot�o for pressionado aumenta SP
+
+		//Se o botão for pressionado aumenta SP
 		if (!(PINC & (1<<PINC1)))
 		{
 			if (gSetpoint < 110)
@@ -528,34 +518,59 @@ int main(void)
 			while (!(PINC & (1<<PINC1)));
 			_delay_ms(100);
 		}
-		
-		//Verifica se a temperatura passou do limiar de alarme (definido via serial com AL=) e dispara o aviso pela serial
-		if (gTemperatura > gLimiarAlarme && !gAlarmeAtivo)
+
+		//Daqui pra baixo só roda quando o Timer1 avisa que passaram 250ms,
+		//garantindo um período de amostragem constante pro controle
+		if (gTick)
 		{
-			gAlarmeAtivo = 1;
-			PORTD |= (1<<PORTD7); //Liga o buzzer
-			uart_print("ALARME: TEMP_ALTA\r\n");
+			gTick = 0;
+
+			ADCSRA |= (1<<ADSC);
+			while (ADCSRA & (1<<ADSC));
+
+			uint16_t tAdcFiltrado = filtro_adc(ADC); //suaviza o ruído da leitura bruta do ADC
+			gTemperatura = ((uint32_t)tAdcFiltrado * 1100) / 1024 / 10;
+
+			//Salva a leitura atual no histórico da EEPROM (buffer circular de 10 posições)
+			salvar_historico_eeprom();
+
+			//Controle ON-OFF com histerese de +- 1°C
+			//(o "gSetpoint > 0 &&" evita um estouro de inteiro sem sinal:
+			//se o setpoint fosse 0, "gSetpoint - 1" daria a volta e viraria
+			//65535, fazendo a lâmpada ligar pra qualquer temperatura)
+			if (!gLampadaLigada && gSetpoint > 0 && gTemperatura <= (gSetpoint - 1))
+			{
+				gLampadaLigada = 1;
+				OCR0B = 99;
+			}
+
+			if (gLampadaLigada && gTemperatura >= (gSetpoint + 1))
+			{
+				gLampadaLigada = 0;
+				OCR0B = 0;
+			}
+
+			//Verifica se a temperatura passou do limiar de alarme (definido via serial com AL=) e dispara o aviso pela serial
+			if (gTemperatura > gLimiarAlarme && !gAlarmeAtivo)
+			{
+				gAlarmeAtivo = 1;
+				PORTD |= (1<<PORTD7); //Liga o buzzer
+				uart_print("ALARME: TEMP_ALTA\r\n");
+			}
+
+			if (gTemperatura <= gLimiarAlarme && gAlarmeAtivo)
+			{
+				gAlarmeAtivo = 0;
+				PORTD &= ~(1<<PORTD7); //Desliga o buzzer
+				uart_print("ALARME: TEMP_NORMALIZADA\r\n");
+			}
+
+			//String com temperatura atual e setpoint enviada pela serial
+			char tMsg[32];
+			sprintf(tMsg, "TEMP=%u;SET=%u\r\n", gTemperatura, gSetpoint);
+			uart_print(tMsg);
+
+			atualizar_display(); //atualiza temperatura e setpoint no LCD
 		}
-
-		if (gTemperatura <= gLimiarAlarme && gAlarmeAtivo)
-		{
-			gAlarmeAtivo = 0;
-			PORTD &= ~(1<<PORTD7); //Desliga o buzzer
-			uart_print("ALARME: TEMP_NORMALIZADA\r\n");
-		}
-
-		//String com temperatura atual e setpoint enviada pela serial
-		char tMsg[32];
-		sprintf(tMsg, "TEMP=%u;SET=%u\r\n", gTemperatura, gSetpoint);
-		uart_print(tMsg);
-
-		//Se um comando chegar pela UART processa esse comando e zera para n�o ser processado novamente
-		if (gComandoPronto)
-		{
-			gComandoPronto = 0;
-			processar_comando();
-		}
-
-		_delay_ms(250);
 	}
 }
